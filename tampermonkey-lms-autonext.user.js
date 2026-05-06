@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LMS Video Auto Next (Commented)
 // @namespace    https://test.top/
-// @version      1.1.3
+// @version      1.1.4
 // @description  视频页自动监测与跳转；测验页只做提示，不自动作答
 // @author       ChatGPT
 // @match        https://lms.sysu.edu.cn/mod/fsresource/view.php*
@@ -85,8 +85,9 @@
     // 自动跳到下一页后，尝试继续播放下一段视频。
     autoPlay: {
       enabled: true,
-      initialDelayMs: 1500,
-      retryDelayMs: 2500,
+      initialDelayMs: 700,
+      retryDelayMs: 1500,
+      openPageInitialDelayMs: 300,
       maxAttempts: 5,
       pendingExpiryMs: 1800000,
     },
@@ -294,7 +295,10 @@
 
     if (state.currentVideo) {
       attachVideoHooks(state.currentVideo);
-      maybeResumePlaybackAfterJump();
+      const resumedFromContext = maybeResumePlaybackAfterJump();
+      if (!resumedFromContext) {
+        maybeAutoPlayOnVideoPageOpen();
+      }
     }
 
     state.lastStatusText = buildStatusText();
@@ -729,18 +733,18 @@
 
   // 如果当前页是自动跳转到达的视频页，则尝试继续播放。
   function maybeResumePlaybackAfterJump() {
-    if (!CONFIG.autoPlay.enabled || !state.currentVideo) return;
+    if (!CONFIG.autoPlay.enabled || !state.currentVideo) return false;
 
     const pending = storageGet(CONFIG.storageKeys.pendingAutoplay, null);
-    if (!pending) return;
+    if (!pending) return false;
     if (Date.now() > Number(pending.expiresAt || 0)) {
       storageDelete(CONFIG.storageKeys.pendingAutoplay);
-      return;
+      return false;
     }
 
     const directArrival = pending.targetUrl && sameUrl(pending.targetUrl, location.href);
     const quizBridgeArrival = !!pending.resumeOnNextVideo && pageLooksLikeQuiz(document.referrer);
-    if (!directArrival && !quizBridgeArrival) return;
+    if (!directArrival && !quizBridgeArrival) return false;
 
     state.autoplayAttempts = 0;
     state.autoplayStateText = TEXT.autoplayPending;
@@ -752,18 +756,47 @@
       referrer: document.referrer || '',
     });
     scheduleAutoplayAttempt(quizBridgeArrival ? 'post-quiz-video' : 'pending-jump');
+    return true;
   }
 
-  function scheduleAutoplayAttempt(reason) {
+  // 只要打开的是视频页，就主动尝试播放，不必等到很久以后再补救。
+  function maybeAutoPlayOnVideoPageOpen() {
+    if (!CONFIG.autoPlay.enabled || !state.currentVideo) return;
+
+    const video = state.currentVideo;
+    if (video.ended) return;
+    if (!video.paused) {
+      state.autoplayStateText = TEXT.autoplayActive;
+      state.lastStatusText = buildStatusText();
+      updatePanel();
+      return;
+    }
+
+    state.autoplayAttempts = 0;
+    state.autoplayStateText = TEXT.autoplayPending;
+    state.lastStatusText = buildStatusText();
+    updatePanel();
+    logEvent('autoplay.page-open', {
+      url: location.href,
+      selector: buildSelector(video),
+    });
+    scheduleAutoplayAttempt('page-open-autoplay', {
+      overrideDelayMs: CONFIG.autoPlay.openPageInitialDelayMs,
+    });
+  }
+
+  function scheduleAutoplayAttempt(reason, options = {}) {
     if (!state.currentVideo) return;
 
     if (state.autoplayTimer) {
       clearTimeout(state.autoplayTimer);
     }
 
-    const delay = state.autoplayAttempts === 0
-      ? CONFIG.autoPlay.initialDelayMs
-      : CONFIG.autoPlay.retryDelayMs;
+    const delay = typeof options.overrideDelayMs === 'number'
+      ? options.overrideDelayMs
+      : state.autoplayAttempts === 0
+        ? CONFIG.autoPlay.initialDelayMs
+        : CONFIG.autoPlay.retryDelayMs;
 
     state.autoplayTimer = setTimeout(() => {
       state.autoplayTimer = null;
