@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LMS Video Auto Next (Commented)
 // @namespace    https://test.top/
-// @version      1.1.8
+// @version      1.1.9
 // @description  视频页自动监测与跳转；测验页只做提示，不自动作答
 // @author       ChatGPT
 // @match        https://lms.sysu.edu.cn/mod/fsresource/view.php*
@@ -20,7 +20,7 @@
 (function () {
   'use strict';
 
-  const SCRIPT_VERSION = '1.1.8';
+  const SCRIPT_VERSION = '1.1.9';
 
   // 面板展示文案统一放在这里，后面改字更方便。
   const TEXT = {
@@ -42,6 +42,7 @@
     videoSelector: '视频选择器',
     nextSelector: '下一节选择器',
     progressInfo: '进度信息',
+    playbackRate: '播放倍速',
     currentStatus: '当前状态',
     nextTarget: '跳转目标',
     logCount: '日志数量',
@@ -68,7 +69,9 @@
     autoplayActive: '续播中',
     autoplayRecovering: '恢复播放中',
     autoplayIdle: '未触发',
+    playbackRateIdle: '未检测',
     reminderAcknowledge: '知道了',
+    rateReminderTitle: '倍速冲突提醒',
   };
 
   // 所有可调整参数集中放在 CONFIG 里。
@@ -115,6 +118,17 @@
       maxAttempts: 3,
       userIntentWindowMs: 1800,
       nearEndSeconds: 1.2,
+    },
+
+    // 尽量把播放倍速锁定在 1 倍速，防止别的插件把倍速偷偷改掉。
+    playbackRateLock: {
+      enabled: true,
+      target: 1,
+      tolerance: 0.01,
+      verifyDelayMs: 220,
+      conflictWindowMs: 15000,
+      reminderThreshold: 4,
+      reminderCooldownMs: 120000,
     },
 
     // 测验页提醒配置。
@@ -215,13 +229,19 @@
     autoplayAttempts: 0,
     pauseResumeAttempts: 0,
     autoplayStateText: TEXT.autoplayIdle,
+    playbackRateStatusText: TEXT.playbackRateIdle,
     nextLockUntil: 0,
     observer: null,
     lastRouteUrl: location.href,
     lastStatusText: '',
     lastQuizReminderUrl: '',
+    lastRateReminderUrl: '',
+    lastRateReminderAt: 0,
     lastUserPauseIntentAt: 0,
     lastSkipTargetSource: '',
+    playbackRateVerifyTimer: null,
+    playbackRateConflictCount: 0,
+    playbackRateConflictWindowStartedAt: 0,
   };
 
   // 启动脚本。
@@ -339,6 +359,9 @@
 
     if (state.currentVideo) {
       attachVideoHooks(state.currentVideo);
+      enforcePlaybackRateLock('video-detected', {
+        skipLogIfStable: true,
+      });
       const resumedFromContext = maybeResumePlaybackAfterJump();
       if (!resumedFromContext) {
         maybeAutoPlayOnVideoPageOpen();
@@ -453,6 +476,10 @@
           maybeRecoverUnexpectedPause(snapshot, 'pause-event');
         }
 
+        if (eventName === 'play' || eventName === 'ratechange' || eventName === 'seeked') {
+          enforcePlaybackRateLock(`video-${eventName}`);
+        }
+
         if (eventName === 'ended') {
           clearPauseRecoveryState();
           maybeGoNext('video-ended', snapshot);
@@ -473,6 +500,10 @@
       state.lastStatusText = buildStatusText();
       updatePanel();
       logEvent('video.sample', snapshot);
+
+      if (!isPlaybackRateTarget(snapshot.playbackRate)) {
+        enforcePlaybackRateLock('video-sample');
+      }
 
       if (snapshot.duration > 0 && snapshot.ended) {
         maybeGoNext('video-ended-sample', snapshot);
@@ -517,6 +548,11 @@
       state.pauseResumeTimer = null;
     }
 
+    if (state.playbackRateVerifyTimer) {
+      clearTimeout(state.playbackRateVerifyTimer);
+      state.playbackRateVerifyTimer = null;
+    }
+
     if (state.forumSkipTimer) {
       clearTimeout(state.forumSkipTimer);
       state.forumSkipTimer = null;
@@ -525,6 +561,9 @@
     state.autoplayAttempts = 0;
     state.pauseResumeAttempts = 0;
     state.autoplayStateText = TEXT.autoplayIdle;
+    state.playbackRateStatusText = TEXT.playbackRateIdle;
+    state.playbackRateConflictCount = 0;
+    state.playbackRateConflictWindowStartedAt = 0;
   }
 
   // 记录“用户刚刚动过播放器”，避免用户手动暂停时脚本立刻抢着恢复。
@@ -611,6 +650,111 @@
       state.pauseResumeTimer = null;
       attemptPauseRecovery(reason);
     }, delay);
+  }
+
+  // 倍速锁：发现播放倍速偏离 1x 时，立即尝试拉回，并在短延迟后验证是否真的锁住。
+  function enforcePlaybackRateLock(reason, options = {}) {
+    if (!CONFIG.playbackRateLock.enabled || !state.currentVideo) return true;
+
+    const video = state.currentVideo;
+    if (!document.contains(video)) return false;
+
+    const currentRate = Number(video.playbackRate || CONFIG.playbackRateLock.target);
+    const defaultRate = Number(video.defaultPlaybackRate || CONFIG.playbackRateLock.target);
+
+    if (isPlaybackRateTarget(currentRate) && isPlaybackRateTarget(defaultRate)) {
+      state.playbackRateStatusText = `已锁定 ${formatRate(CONFIG.playbackRateLock.target)}`;
+      state.lastStatusText = buildStatusText();
+      updatePanel();
+      return true;
+    }
+
+    notePlaybackRateConflict();
+    state.playbackRateStatusText = `正在纠正到 ${formatRate(CONFIG.playbackRateLock.target)} (${state.playbackRateConflictCount})`;
+
+    try {
+      video.defaultPlaybackRate = CONFIG.playbackRateLock.target;
+    } catch (_) {}
+
+    try {
+      video.playbackRate = CONFIG.playbackRateLock.target;
+    } catch (_) {}
+
+    state.lastStatusText = buildStatusText();
+    updatePanel();
+
+    if (!options.skipLogIfStable) {
+      logEvent('playback-rate.correct-attempt', {
+        reason,
+        from: round(currentRate, 2),
+        defaultFrom: round(defaultRate, 2),
+        to: CONFIG.playbackRateLock.target,
+        conflictCount: state.playbackRateConflictCount,
+      });
+    }
+
+    schedulePlaybackRateVerification(reason);
+    return false;
+  }
+
+  function schedulePlaybackRateVerification(reason) {
+    if (state.playbackRateVerifyTimer) {
+      clearTimeout(state.playbackRateVerifyTimer);
+    }
+
+    state.playbackRateVerifyTimer = setTimeout(() => {
+      state.playbackRateVerifyTimer = null;
+      verifyPlaybackRateLock(reason);
+    }, CONFIG.playbackRateLock.verifyDelayMs);
+  }
+
+  function verifyPlaybackRateLock(reason) {
+    if (!CONFIG.playbackRateLock.enabled || !state.currentVideo) return;
+
+    const video = state.currentVideo;
+    if (!document.contains(video)) return;
+
+    const currentRate = Number(video.playbackRate || CONFIG.playbackRateLock.target);
+    const defaultRate = Number(video.defaultPlaybackRate || CONFIG.playbackRateLock.target);
+    const locked = isPlaybackRateTarget(currentRate) && isPlaybackRateTarget(defaultRate);
+
+    if (locked) {
+      state.playbackRateStatusText = `已锁定 ${formatRate(CONFIG.playbackRateLock.target)}`;
+      state.lastStatusText = buildStatusText();
+      updatePanel();
+      logEvent('playback-rate.correct-success', {
+        reason,
+        currentRate: round(currentRate, 2),
+        defaultRate: round(defaultRate, 2),
+      });
+      return;
+    }
+
+    state.playbackRateStatusText = `检测到外部插件改成 ${formatRate(currentRate)}`;
+    state.lastStatusText = buildStatusText();
+    updatePanel();
+    logEvent('playback-rate.correct-failed', {
+      reason,
+      currentRate: round(currentRate, 2),
+      defaultRate: round(defaultRate, 2),
+      conflictCount: state.playbackRateConflictCount,
+    });
+    maybeShowPlaybackRateReminder(currentRate);
+  }
+
+  function notePlaybackRateConflict() {
+    const now = Date.now();
+    if (!state.playbackRateConflictWindowStartedAt ||
+      now - state.playbackRateConflictWindowStartedAt > CONFIG.playbackRateLock.conflictWindowMs) {
+      state.playbackRateConflictWindowStartedAt = now;
+      state.playbackRateConflictCount = 0;
+    }
+
+    state.playbackRateConflictCount += 1;
+  }
+
+  function isPlaybackRateTarget(value) {
+    return Math.abs(Number(value || 0) - CONFIG.playbackRateLock.target) <= CONFIG.playbackRateLock.tolerance;
   }
 
   // 讨论页只做“跳过到下一个视频”的自动化，不停留在大量回帖内容里。
@@ -1244,6 +1388,56 @@
     document.body.appendChild(overlay);
   }
 
+  // 如果倍速被外部插件反复改掉，就弹窗提醒用户关闭插件或换到隐私/无痕模式。
+  function maybeShowPlaybackRateReminder(currentRate) {
+    const now = Date.now();
+    if (state.playbackRateConflictCount < CONFIG.playbackRateLock.reminderThreshold) return;
+    if (state.lastRateReminderUrl === location.href &&
+      now - state.lastRateReminderAt < CONFIG.playbackRateLock.reminderCooldownMs) {
+      return;
+    }
+
+    state.lastRateReminderUrl = location.href;
+    state.lastRateReminderAt = now;
+    renderPlaybackRateReminderOverlay(currentRate);
+    playQuizReminderBeep();
+    logEvent('playback-rate.reminder-shown', {
+      currentRate: round(currentRate, 2),
+      conflictCount: state.playbackRateConflictCount,
+      url: location.href,
+    });
+  }
+
+  function renderPlaybackRateReminderOverlay(currentRate) {
+    const overlayId = `${CONFIG.panelId}-rate-reminder`;
+    const old = document.getElementById(overlayId);
+    if (old) old.remove();
+
+    const overlay = document.createElement('div');
+    overlay.id = overlayId;
+    overlay.innerHTML = `
+      <div class="tm-quiz-mask"></div>
+      <div class="tm-quiz-dialog">
+        <div class="tm-quiz-title">${escapeHtml(TEXT.rateReminderTitle)}</div>
+        <div class="tm-quiz-body">${escapeHtml(buildPlaybackRateReminderBody(currentRate))}</div>
+        <button class="tm-quiz-button" type="button" data-action="dismiss-rate-reminder">${escapeHtml(TEXT.reminderAcknowledge)}</button>
+      </div>
+    `;
+
+    overlay.addEventListener('click', (event) => {
+      const button = event.target.closest('[data-action="dismiss-rate-reminder"]');
+      if (button || event.target.classList.contains('tm-quiz-mask')) {
+        overlay.remove();
+      }
+    });
+
+    document.body.appendChild(overlay);
+  }
+
+  function buildPlaybackRateReminderBody(currentRate) {
+    return `检测到其他浏览器插件或脚本正在把视频倍速反复改成 ${formatRate(currentRate)}，当前脚本已多次尝试拉回 1.00x。请先关闭其他倍速插件；如果仍有冲突，建议改用浏览器隐私/无痕模式重新打开课程页面。若使用隐私/无痕模式，请先在扩展管理中允许 Tampermonkey 在该模式下运行，并在该模式中重新启用这份脚本。`;
+  }
+
   // 用 Web Audio API 发几声短蜂鸣，浏览器若拦截则静默失败。
   async function playQuizReminderBeep() {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
@@ -1479,6 +1673,12 @@
       </div>
 
       <div class="tm-card">
+        <div><strong>${TEXT.playbackRate}</strong></div>
+        <div>${escapeHtml(state.playbackRateStatusText)}</div>
+        <div class="tm-mini">${state.currentVideo ? escapeHtml(formatRate(collectVideoSnapshot(state.currentVideo).playbackRate)) : TEXT.noVideo}</div>
+      </div>
+
+      <div class="tm-card">
         <div><strong>${TEXT.videoSelector}</strong></div>
         <code>${escapeHtml(videoSelector)}</code>
         <div class="tm-mini">${state.currentVideo ? escapeHtml(JSON.stringify(collectVideoSnapshot(state.currentVideo))) : TEXT.noVideo}</div>
@@ -1533,6 +1733,7 @@
       `Video: ${state.currentVideo ? TEXT.videoFound : TEXT.videoMissing}`,
       `Next: ${state.currentNextButton ? TEXT.nextFound : TEXT.nextMissing}`,
       `AutoPlay: ${state.autoplayStateText}`,
+      `Rate: ${state.playbackRateStatusText}`,
       `Mode: ${CONFIG.dryRun ? TEXT.modeDryRun : TEXT.modeRealClick}`,
     ];
     return parts.join(' | ');
@@ -1831,6 +2032,10 @@
     return TEXT.notFound;
   }
 
+  function formatRate(value) {
+    return `${Number(round(Number(value || 0), 2)).toFixed(2)}x`;
+  }
+
   function pageLooksLikeQuiz(url) {
     const value = String(url || '');
     return value.includes('/mod/quiz/view.php') ||
@@ -2012,19 +2217,22 @@
         padding-top: 0;
       }
 
-      #${CONFIG.panelId}-quiz-reminder {
+      #${CONFIG.panelId}-quiz-reminder,
+      #${CONFIG.panelId}-rate-reminder {
         position: fixed;
         inset: 0;
         z-index: 2147483646;
       }
 
-      #${CONFIG.panelId}-quiz-reminder .tm-quiz-mask {
+      #${CONFIG.panelId}-quiz-reminder .tm-quiz-mask,
+      #${CONFIG.panelId}-rate-reminder .tm-quiz-mask {
         position: absolute;
         inset: 0;
         background: rgba(0, 0, 0, 0.45);
       }
 
-      #${CONFIG.panelId}-quiz-reminder .tm-quiz-dialog {
+      #${CONFIG.panelId}-quiz-reminder .tm-quiz-dialog,
+      #${CONFIG.panelId}-rate-reminder .tm-quiz-dialog {
         position: absolute;
         top: 50%;
         left: 50%;
@@ -2037,17 +2245,20 @@
         box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
       }
 
-      #${CONFIG.panelId}-quiz-reminder .tm-quiz-title {
+      #${CONFIG.panelId}-quiz-reminder .tm-quiz-title,
+      #${CONFIG.panelId}-rate-reminder .tm-quiz-title {
         font: 700 20px/1.3 "Microsoft YaHei", sans-serif;
         margin-bottom: 12px;
       }
 
-      #${CONFIG.panelId}-quiz-reminder .tm-quiz-body {
+      #${CONFIG.panelId}-quiz-reminder .tm-quiz-body,
+      #${CONFIG.panelId}-rate-reminder .tm-quiz-body {
         font: 14px/1.7 "Microsoft YaHei", sans-serif;
         margin-bottom: 16px;
       }
 
-      #${CONFIG.panelId}-quiz-reminder .tm-quiz-button {
+      #${CONFIG.panelId}-quiz-reminder .tm-quiz-button,
+      #${CONFIG.panelId}-rate-reminder .tm-quiz-button {
         border: none;
         background: #166534;
         color: #fff;
