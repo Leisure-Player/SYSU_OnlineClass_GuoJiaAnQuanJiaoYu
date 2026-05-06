@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LMS Video Auto Next (Commented)
 // @namespace    https://test.top/
-// @version      1.1.4
+// @version      1.1.5
 // @description  视频页自动监测与跳转；测验页只做提示，不自动作答
 // @author       ChatGPT
 // @match        https://lms.sysu.edu.cn/mod/fsresource/view.php*
@@ -67,9 +67,11 @@
   const CONFIG = {
     // 默认先用 dryRun，只记录不真正跳转。
     dryRun: true,
-    // 当前进度非常接近结束时，才允许用进度兜底跳转。
+    // 是否允许按播放进度兜底跳下一节。
+    // 当前站点播放器偶尔会上报异常进度，所以默认关闭，只依赖 ended 事件。
+    allowProgressFallback: false,
+    // 下面两个值只在 allowProgressFallback=true 时才生效。
     completeRatio: 0.9995,
-    // 只有剩余时间极短时，才允许用进度兜底跳转。
     completeRemainingSeconds: 0.8,
     // 定时采样间隔。
     sampleIntervalMs: 4000,
@@ -430,7 +432,12 @@
       updatePanel();
       logEvent('video.sample', snapshot);
 
-      if (snapshot.duration > 0 && (snapshot.ended || shouldAdvanceByProgress(snapshot))) {
+      if (snapshot.duration > 0 && snapshot.ended) {
+        maybeGoNext('video-ended-sample', snapshot);
+        return;
+      }
+
+      if (snapshot.duration > 0 && CONFIG.allowProgressFallback && shouldAdvanceByProgress(snapshot)) {
         maybeGoNext('ratio-threshold', snapshot);
       }
     }, CONFIG.sampleIntervalMs);
