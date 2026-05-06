@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         LMS Video Auto Next (Commented)
 // @namespace    https://test.top/
-// @version      1.1.6
+// @version      1.1.8
 // @description  视频页自动监测与跳转；测验页只做提示，不自动作答
 // @author       ChatGPT
 // @match        https://lms.sysu.edu.cn/mod/fsresource/view.php*
+// @match        https://lms.sysu.edu.cn/mod/forum/view.php*
+// @match        https://lms.sysu.edu.cn/mod/forum/discuss.php*
 // @match        https://lms.sysu.edu.cn/mod/quiz/view.php*
 // @match        https://lms.sysu.edu.cn/mod/quiz/attempt.php*
 // @match        https://lms.sysu.edu.cn/mod/quiz/summary.php*
@@ -18,9 +20,12 @@
 (function () {
   'use strict';
 
+  const SCRIPT_VERSION = '1.1.8';
+
   // 面板展示文案统一放在这里，后面改字更方便。
   const TEXT = {
     panelTitle: 'LMS Auto Next',
+    version: '脚本版本',
     collapse: '收起',
     expand: '展开',
     dryRunOn: 'dryRun: ON',
@@ -38,9 +43,12 @@
     nextSelector: '下一节选择器',
     progressInfo: '进度信息',
     currentStatus: '当前状态',
+    nextTarget: '跳转目标',
     logCount: '日志数量',
+    recentLogs: '最近日志',
     notFound: '未找到',
     noVideo: '无视频',
+    noLogs: '暂无日志',
     oldDataCleared: '旧数据已清空，页面即将刷新。',
     modeDryRun: 'dryRun',
     modeRealClick: 'real-click',
@@ -86,6 +94,8 @@
     mutationDebounceMs: 1000,
     // 最多保留多少条日志。
     maxLogs: 1000,
+    // 面板中最近日志的展示条数。
+    recentLogsLimit: 6,
 
     // 自动跳到下一页后，尝试继续播放下一段视频。
     autoPlay: {
@@ -114,6 +124,12 @@
       beepIntervalMs: 700,
       beepDurationMs: 220,
       beepFrequency: 880,
+    },
+
+    // 讨论页不需要人工停留时，自动跳过到下一项视频。
+    forumSkip: {
+      enabled: true,
+      delayMs: 800,
     },
 
     // 关键元素选择器。
@@ -195,6 +211,7 @@
     mutationTimer: null,
     autoplayTimer: null,
     pauseResumeTimer: null,
+    forumSkipTimer: null,
     autoplayAttempts: 0,
     pauseResumeAttempts: 0,
     autoplayStateText: TEXT.autoplayIdle,
@@ -204,6 +221,7 @@
     lastStatusText: '',
     lastQuizReminderUrl: '',
     lastUserPauseIntentAt: 0,
+    lastSkipTargetSource: '',
   };
 
   // 启动脚本。
@@ -263,6 +281,8 @@
   function detectPageType() {
     const path = location.pathname;
     if (path.includes('/mod/fsresource/view.php')) return 'video';
+    if (path.includes('/mod/forum/view.php')) return 'forum-view';
+    if (path.includes('/mod/forum/discuss.php')) return 'forum-discuss';
     if (path.includes('/mod/quiz/view.php')) return 'quiz-view';
     if (path.includes('/mod/quiz/attempt.php')) return 'quiz-attempt';
     if (path.includes('/mod/quiz/summary.php')) return 'quiz-summary';
@@ -271,6 +291,10 @@
 
   function isQuizPage() {
     return state.pageType.startsWith('quiz');
+  }
+
+  function isDiscussionPage() {
+    return state.pageType === 'forum-view' || state.pageType === 'forum-discuss';
   }
 
   // 每次扫描都重新识别页面类型和关键节点。
@@ -293,10 +317,25 @@
       return;
     }
 
-    state.currentVideo = findVideo();
     state.currentNextButton = findNextButton();
     state.currentTitle = findTitleElement();
     state.currentProgress = findProgressElement();
+
+    // 讨论页命中后直接准备跳过，不进入视频监听逻辑。
+    if (isDiscussionPage()) {
+      state.lastStatusText = buildStatusText();
+      updatePanel();
+      logEvent('forum.detected', {
+        reason,
+        pageType: state.pageType,
+        url: location.href,
+        foundNextButton: !!state.currentNextButton,
+      });
+      maybeSkipDiscussionPage(reason);
+      return;
+    }
+
+    state.currentVideo = findVideo();
 
     if (state.currentVideo) {
       attachVideoHooks(state.currentVideo);
@@ -478,6 +517,11 @@
       state.pauseResumeTimer = null;
     }
 
+    if (state.forumSkipTimer) {
+      clearTimeout(state.forumSkipTimer);
+      state.forumSkipTimer = null;
+    }
+
     state.autoplayAttempts = 0;
     state.pauseResumeAttempts = 0;
     state.autoplayStateText = TEXT.autoplayIdle;
@@ -567,6 +611,125 @@
       state.pauseResumeTimer = null;
       attemptPauseRecovery(reason);
     }, delay);
+  }
+
+  // 讨论页只做“跳过到下一个视频”的自动化，不停留在大量回帖内容里。
+  function maybeSkipDiscussionPage(reason) {
+    if (!CONFIG.forumSkip.enabled) return;
+
+    const target = findDiscussionSkipTarget();
+    if (!target) {
+      state.lastSkipTargetSource = '';
+      logEvent('forum.skip-target-not-found', {
+        reason,
+        pageType: state.pageType,
+        url: location.href,
+      });
+      return;
+    }
+
+    const payload = {
+      reason,
+      dryRun: CONFIG.dryRun,
+      pageType: state.pageType,
+      source: target.source,
+      nextText: getText(target.element),
+      nextSelector: target.element ? buildSelector(target.element) : '',
+      href: target.href,
+    };
+
+    state.lastSkipTargetSource = target.source;
+    state.lastStatusText = buildStatusText();
+    updatePanel();
+
+    if (CONFIG.dryRun) {
+      logEvent('forum.skip-dry-run', payload);
+      return;
+    }
+
+    if (Date.now() < state.nextLockUntil) {
+      logEvent('forum.skip-locked', {
+        ...payload,
+        lockUntil: state.nextLockUntil,
+      });
+      return;
+    }
+
+    state.nextLockUntil = Date.now() + CONFIG.clickLockMs;
+
+    if (state.forumSkipTimer) {
+      clearTimeout(state.forumSkipTimer);
+    }
+
+    logEvent('forum.skip-scheduled', {
+      ...payload,
+      delayMs: CONFIG.forumSkip.delayMs,
+    });
+
+    state.forumSkipTimer = setTimeout(() => {
+      state.forumSkipTimer = null;
+      if (!pageLooksLikeForum(location.href)) return;
+      performNextNavigation(target.element, target.href, 'forum-skip');
+    }, CONFIG.forumSkip.delayMs);
+  }
+
+  // 优先用底部下一项按钮；如果下一项不是视频，再用“跳至...”下拉找当前讨论后面的第一个视频。
+  function findDiscussionSkipTarget() {
+    const nextButton = state.currentNextButton || findNextButton();
+    const nextHref = resolveNextHref(nextButton);
+
+    if (nextButton && nextHref && pageLooksLikeVideo(nextHref)) {
+      return {
+        element: nextButton,
+        href: nextHref,
+        source: 'next-activity-link',
+      };
+    }
+
+    const jumpHref = findNextVideoHrefFromJumpSelect();
+    if (jumpHref) {
+      return {
+        element: nextButton || safeQuery('#jump-to-activity') || safeQuery('select.urlselect'),
+        href: jumpHref,
+        source: 'jump-select-next-video',
+      };
+    }
+
+    if (nextButton && nextHref) {
+      return {
+        element: nextButton,
+        href: nextHref,
+        source: 'next-activity-fallback',
+      };
+    }
+
+    return null;
+  }
+
+  function findNextVideoHrefFromJumpSelect() {
+    const select = safeQuery('#jump-to-activity') ||
+      safeQuery('select.urlselect') ||
+      safeQuery('select[name="jump"]');
+
+    if (!(select instanceof HTMLSelectElement)) return '';
+
+    const options = Array.from(select.options || []);
+    if (!options.length) return '';
+
+    const currentIndex = options.findIndex((option) => {
+      const href = absolutizeUrl(option.value || '');
+      return href && sameUrl(href, location.href);
+    });
+
+    const startIndex = currentIndex >= 0 ? currentIndex + 1 : 0;
+    for (let index = startIndex; index < options.length; index += 1) {
+      const href = absolutizeUrl(options[index].value || '');
+      if (href && pageLooksLikeVideo(href)) {
+        return href;
+      }
+    }
+
+    return '';
   }
 
   // 统一处理“跳下一节”逻辑，含 dryRun 和防重复锁。
@@ -682,11 +845,7 @@
       return '';
     }
 
-    try {
-      return new URL(rawHref, location.href).href;
-    } catch (_) {
-      return '';
-    }
+    return absolutizeUrl(rawHref);
   }
 
   // 当前版本采用“硬跳”策略：只要有 href，就直接跳过去。
@@ -1200,7 +1359,10 @@
     panel.id = CONFIG.panelId;
     panel.innerHTML = `
       <div class="tm-head">
-        <div class="tm-title">${TEXT.panelTitle}</div>
+        <div class="tm-head-left">
+          <div class="tm-title">${TEXT.panelTitle}</div>
+          <div class="tm-version">${TEXT.version} ${SCRIPT_VERSION}</div>
+        </div>
         <div class="tm-head-right">
           <button class="tm-collapse-button" type="button" data-action="toggle-collapse" data-role="collapse-toggle">${TEXT.collapse}</button>
           <div class="tm-badge" data-role="dry-run-badge">${TEXT.dryRunOn}</div>
@@ -1287,6 +1449,8 @@
     const titleText = state.currentTitle ? getText(state.currentTitle) : document.title;
     const progressText = state.currentProgress ? getText(state.currentProgress) : TEXT.notFound;
     const logs = storageGet(CONFIG.storageKeys.logs, []);
+    const recentLogs = getRecentLogs(logs);
+    const nextTargetText = buildNextTargetText();
 
     state.panelBody.innerHTML = `
       <div class="tm-actions">
@@ -1306,6 +1470,7 @@
       <div class="tm-card">
         <div><strong>${TEXT.pageType}</strong></div>
         <div>${escapeHtml(pageTypeText)}</div>
+        <div class="tm-mini">${TEXT.version}: ${escapeHtml(SCRIPT_VERSION)}</div>
       </div>
 
       <div class="tm-card">
@@ -1336,7 +1501,18 @@
       </div>
 
       <div class="tm-card">
+        <div><strong>${TEXT.nextTarget}</strong></div>
+        <div>${escapeHtml(shorten(nextTargetText, 140))}</div>
+      </div>
+
+      <div class="tm-card">
         <div><strong>${TEXT.logCount}</strong>: ${Array.isArray(logs) ? logs.length : 0}</div>
+        <div class="tm-mini">${recentLogs[0] ? escapeHtml(formatLogLine(recentLogs[0])) : TEXT.noLogs}</div>
+      </div>
+
+      <div class="tm-card">
+        <div><strong>${TEXT.recentLogs}</strong></div>
+        <div class="tm-log-list">${renderRecentLogs(recentLogs)}</div>
       </div>
 
       ${isQuizPage() ? `
@@ -1366,6 +1542,10 @@
     switch (pageType) {
       case 'video':
         return TEXT.pageVideo;
+      case 'forum-view':
+        return '讨论列表页';
+      case 'forum-discuss':
+        return '讨论详情页';
       case 'quiz-view':
         return TEXT.pageQuizView;
       case 'quiz-attempt':
@@ -1394,14 +1574,27 @@
   // 导出日志，方便排障。
   function exportLogs() {
     const logs = storageGet(CONFIG.storageKeys.logs, []);
-    const blob = new Blob([JSON.stringify(logs, null, 2)], {
+    const exported = {
+      meta: {
+        exportedAt: new Date().toISOString(),
+        scriptVersion: SCRIPT_VERSION,
+        url: location.href,
+        pageType: state.pageType,
+        pageTypeText: getPageTypeText(state.pageType),
+        title: state.currentTitle ? getText(state.currentTitle) : document.title,
+        dryRun: CONFIG.dryRun,
+        logCount: Array.isArray(logs) ? logs.length : 0,
+      },
+      logs,
+    };
+    const blob = new Blob([JSON.stringify(exported, null, 2)], {
       type: 'application/json;charset=utf-8',
     });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
 
     a.href = url;
-    a.download = `lms-autonext-logs-${Date.now()}.json`;
+    a.download = `lms-autonext-v${SCRIPT_VERSION}-logs-${Date.now()}.json`;
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -1413,9 +1606,14 @@
   function logEvent(type, payload) {
     const logs = storageGet(CONFIG.storageKeys.logs, []);
     logs.push({
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       time: new Date().toISOString(),
+      version: SCRIPT_VERSION,
       type,
+      pageType: state.pageType,
+      pageTypeText: getPageTypeText(state.pageType),
       url: location.href,
+      referrer: document.referrer || '',
       pageTitle: document.title,
       courseTitle: state.currentTitle ? getText(state.currentTitle) : document.title,
       dryRun: CONFIG.dryRun,
@@ -1546,6 +1744,93 @@
     return typeof value === 'string' ? value.trim().replace(/\s+/g, ' ') : '';
   }
 
+  function absolutizeUrl(rawUrl) {
+    try {
+      return new URL(String(rawUrl || ''), location.href).href;
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function pageLooksLikeVideo(url) {
+    return String(url || '').includes('/mod/fsresource/view.php');
+  }
+
+  function pageLooksLikeForum(url) {
+    const value = String(url || '');
+    return value.includes('/mod/forum/view.php') ||
+      value.includes('/mod/forum/discuss.php');
+  }
+
+  function getRecentLogs(logs) {
+    if (!Array.isArray(logs)) return [];
+    return logs.slice(-CONFIG.recentLogsLimit).reverse();
+  }
+
+  function renderRecentLogs(logs) {
+    if (!Array.isArray(logs) || !logs.length) {
+      return `<div class="tm-mini">${escapeHtml(TEXT.noLogs)}</div>`;
+    }
+
+    return logs.map((log) => `<div class="tm-log-item">${escapeHtml(formatLogLine(log))}</div>`).join('');
+  }
+
+  function formatLogLine(log) {
+    const timeText = formatLocalTime(log?.time);
+    const typeText = String(log?.type || 'unknown');
+    const detailText = summarizeLogDetail(log);
+    return detailText ? `${timeText} | ${typeText} | ${detailText}` : `${timeText} | ${typeText}`;
+  }
+
+  function summarizeLogDetail(log) {
+    const payload = log && log.payload ? log.payload : {};
+
+    if (payload.reason && payload.href) {
+      return `${payload.reason} -> ${shorten(payload.href, 60)}`;
+    }
+    if (payload.reason && payload.to) {
+      return `${payload.reason} -> ${shorten(payload.to, 60)}`;
+    }
+    if (payload.source && payload.href) {
+      return `${payload.source} -> ${shorten(payload.href, 60)}`;
+    }
+    if (payload.reason) {
+      return String(payload.reason);
+    }
+    if (payload.pageType) {
+      return String(payload.pageType);
+    }
+    if (payload.url) {
+      return shorten(String(payload.url), 60);
+    }
+    return '';
+  }
+
+  function formatLocalTime(input) {
+    try {
+      const date = new Date(input);
+      if (Number.isNaN(date.getTime())) return '--:--:--';
+      return date.toLocaleTimeString('zh-CN', { hour12: false });
+    } catch (_) {
+      return '--:--:--';
+    }
+  }
+
+  function buildNextTargetText() {
+    if (isDiscussionPage()) {
+      const target = findDiscussionSkipTarget();
+      if (!target) return TEXT.notFound;
+      return `${target.source} -> ${target.href}`;
+    }
+
+    if (state.currentNextButton) {
+      const nextHref = resolveNextHref(state.currentNextButton);
+      return `${getText(state.currentNextButton)} -> ${nextHref || TEXT.notFound}`;
+    }
+
+    return TEXT.notFound;
+  }
+
   function pageLooksLikeQuiz(url) {
     const value = String(url || '');
     return value.includes('/mod/quiz/view.php') ||
@@ -1625,6 +1910,16 @@
         color: #f9fafb;
       }
 
+      #${CONFIG.panelId} .tm-head-left {
+        min-width: 0;
+      }
+
+      #${CONFIG.panelId} .tm-version {
+        margin-top: 2px;
+        color: #94a3b8;
+        font-size: 11px;
+      }
+
       #${CONFIG.panelId} .tm-head-right {
         display: flex;
         align-items: center;
@@ -1698,6 +1993,23 @@
         color: #cbd5e1;
         white-space: pre-wrap;
         word-break: break-word;
+      }
+
+      #${CONFIG.panelId} .tm-log-list {
+        margin-top: 6px;
+      }
+
+      #${CONFIG.panelId} .tm-log-item {
+        padding: 4px 0;
+        border-top: 1px solid rgba(255,255,255,0.06);
+        color: #cbd5e1;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      #${CONFIG.panelId} .tm-log-item:first-child {
+        border-top: none;
+        padding-top: 0;
       }
 
       #${CONFIG.panelId}-quiz-reminder {
