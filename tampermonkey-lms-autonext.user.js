@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LMS Video Auto Next (Commented)
 // @namespace    https://test.top/
-// @version      1.1.5
+// @version      1.1.6
 // @description  视频页自动监测与跳转；测验页只做提示，不自动作答
 // @author       ChatGPT
 // @match        https://lms.sysu.edu.cn/mod/fsresource/view.php*
@@ -73,6 +73,9 @@
     // 下面两个值只在 allowProgressFallback=true 时才生效。
     completeRatio: 0.9995,
     completeRemainingSeconds: 0.8,
+    // 即便播放器误报 ended，也只有真的接近片尾才允许自动跳页。
+    verifiedEndRatio: 0.985,
+    verifiedEndRemainingSeconds: 2.5,
     // 定时采样间隔。
     sampleIntervalMs: 4000,
     // 防重复跳转锁，避免一次结束触发多次跳页。
@@ -573,6 +576,14 @@
       return;
     }
 
+    if (!isSafeAdvanceTrigger(reason, snapshot)) {
+      logEvent('next.ignored-unsafe-trigger', {
+        reason,
+        snapshot,
+      });
+      return;
+    }
+
     if (Date.now() < state.nextLockUntil) {
       logEvent('next.locked', {
         reason,
@@ -601,6 +612,31 @@
 
     logEvent('next.navigate', payload);
     performNextNavigation(state.currentNextButton, nextHref, reason);
+  }
+
+  // 对所有自动跳页触发再做一层硬校验，防止播放器中途误报 ended。
+  function isSafeAdvanceTrigger(reason, snapshot) {
+    if (reason === 'manual-test') return true;
+    if (!snapshot) return false;
+    if (reason === 'ratio-threshold') {
+      return CONFIG.allowProgressFallback && isSnapshotNearVideoEnd(snapshot);
+    }
+    if (reason === 'video-ended' || reason === 'video-ended-sample') {
+      return snapshot.ended && isSnapshotNearVideoEnd(snapshot);
+    }
+    return false;
+  }
+
+  function isSnapshotNearVideoEnd(snapshot) {
+    if (!snapshot) return false;
+    if (!(snapshot.duration > 0)) return false;
+
+    const ratio = Number(snapshot.ratio || 0);
+    const remaining = Number(snapshot.duration || 0) - Number(snapshot.currentTime || 0);
+
+    return ratio >= CONFIG.verifiedEndRatio &&
+      remaining >= 0 &&
+      remaining <= CONFIG.verifiedEndRemainingSeconds;
   }
 
   // 采集视频状态，便于日志分析和面板展示。
