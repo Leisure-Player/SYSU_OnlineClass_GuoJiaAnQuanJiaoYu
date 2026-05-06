@@ -1,4 +1,4 @@
-# LMS Video Auto Next
+# LMS Video Auto Next——可用于中山大学在线教学平台
 
 一个用于 LMS 在线课程页面的 Tampermonkey 用户脚本。
 
