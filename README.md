@@ -50,11 +50,9 @@
 ### 2. 导入脚本
 
 1. 打开 Tampermonkey 面板
-2. 选择“创建新脚本”
-3. 删除默认内容
-4. 将 `tampermonkey-lms-autonext.user.js` 的内容粘贴进去
-5. 保存脚本
-6. 刷新 LMS 页面
+2. 将 `tampermonkey-lms-autonext.user.js` 文件拖入Tampermonkey页面
+3. 点击安装脚本
+4. 打开中山大学在线教育平台，并刷新页面
 
 ## 使用说明
 
