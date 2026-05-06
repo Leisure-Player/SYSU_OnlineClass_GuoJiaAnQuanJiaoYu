@@ -52,7 +52,7 @@
 1. 打开 Tampermonkey 面板
 2. 将 `tampermonkey-lms-autonext.user.js` 文件拖入Tampermonkey页面
 3. 点击安装脚本
-4. 打开中山大学在线教育平台，并刷新页面
+4. 打开中山大学在线教学平台，并刷新页面
 
 ## 使用说明
 
