@@ -62,8 +62,6 @@
 4. 1.2.1 起脚本会申请 `GM_xmlhttpRequest` 与 `lms.sysu.edu.cn` 连接权限，用于携带登录态读取课程主页，请点击允许
 5. 打开中山大学在线教学平台，并刷新页面
 
-也可以直接打开 [脚本安装链接](https://raw.githubusercontent.com/wocwang/SYSU_LMS_AutoNext/main/tampermonkey-lms-autonext.user.js)，Tampermonkey 会自动弹出安装页。
-
 ## 使用说明
 
 ### 基本流程
